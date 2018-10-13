@@ -14,6 +14,8 @@ import Data.Int (Int32, Int64)
 import Data.Bits ((.&.), shift)
 import qualified Data.Char as Char
 import qualified Data.Map as Map
+import qualified Data.Text as Text
+import qualified Data.Text.Lazy as LazyText
 import Data.Monoid ((<>), mempty)
 import Data.Proxy
 import Prelude hiding (and, or)
@@ -27,20 +29,90 @@ import qualified Data.ByteString.Builder as BSBuilder
 import Idris.Core.TT (Name(..), Const(..), NativeTy(..), IntTy(..), ArithTy(..), isTypeConst)
 import IRTS.Bytecode
 import IRTS.CodegenCommon
-import IRTS.Lang (PrimFn(..))
+import IRTS.CodegenC
+import IRTS.Lang (PrimFn(..), FDesc(..))
 
 import Language.Wasm.Structure
 import qualified Language.Wasm.Binary as WasmBinary
 import Language.Wasm.Builder
 
+data ForeignCall = FC Name FDesc [FDesc]
+    
+filterMap :: (a -> Maybe b) -> [a] -> [b]
+filterMap f l =
+    concat (filterMap' f l)
+    where
+      filterMap' f l =
+          case l of
+            [] -> []
+            h : t ->
+                case f h of
+                  Just a -> [a] : (filterMap' f t)
+                  Nothing -> filterMap' f t
+
+stripReg :: [(FDesc,Reg)] -> [FDesc]
+stripReg l = map (\(f,r) -> f) l
+                  
 codegenWasm :: CodeGenerator
 codegenWasm ci = do
     let bc = map toBC $ simpleDecls ci
-    let wasmModule = mkWasm bc (64 * 1024) (256 * 1024)
+    let foreignImports = filterMap onlyForeign bc
+    let wasmModule = mkWasm foreignImports bc (64 * 1024) (256 * 1024)
     LBS.writeFile (outputFile ci) $ WasmBinary.dumpModuleLazy wasmModule
+    where
+      onlyForeign :: (Name, [BC]) -> Maybe ForeignCall
+      onlyForeign (x,y) =
+          case y of
+            (FOREIGNCALL _ ret (FStr name) args) : tl ->
+                Just (FC (UN (Text.pack name)) ret (stripReg args))
+            _ : tl -> onlyForeign (x,tl)
+            [] -> Nothing
 
-mkWasm :: [(Name, [BC])] -> Int -> Int -> Module
-mkWasm defs stackSize heapSize =
+wasmArgFromFDesc :: FDesc -> [ValueType]
+wasmArgFromFDesc fd =
+    case fd of
+      FCon (UN "C_IntNative") -> [I32]
+      FCon (UN "C_Ptr") -> [I32]
+      FCon _ -> [F64]
+      FUnknown -> [I32]
+      FApp (UN "C_IntT") ops -> [I32] -- concat (map wasmArgFromFDesc ops)
+      _ -> []
+
+onlyReturn :: String -> [ForeignCall] -> [ForeignCall]
+onlyReturn callRes l =
+    filter onlyReturn' l
+    where
+      onlyReturn' (FC name res args) =
+          case res of
+            FCon (UN callRes) -> True
+            _ -> False
+
+showableFDesc fdesc =
+    case fdesc of
+      FStr n -> n
+      _ -> show fdesc
+                 
+makeImportExtern rv f@(FC name ret args) = do
+    funIdx <-
+        importFunction
+          "C" (LazyText.pack (show name)) rv (concat (map wasmArgFromFDesc args))
+    return ( show name, funIdx )
+
+-- getVoidMap (GB { externsVoid }) = externsVoid
+           
+-- findExternVoid fdesc (GB { externsVoid }) =
+--     Map.lookup (showableFDesc fdesc) externsVoid
+
+getExtern32Map (GB { externs32 }) = externs32
+
+findExternDbl fdesc (GB { externsF }) =
+    Map.lookup (showableFDesc fdesc) externsF
+
+findExtern32 fdesc (GB { externs32 }) =
+    Map.lookup (showableFDesc fdesc) externs32
+           
+mkWasm :: [ForeignCall] -> [(Name, [BC])] -> Int -> Int -> Module
+mkWasm forn defs stackSize heapSize =
     genMod $ do
         -- gc <- importFunction "rts" "gc" () [I32]
         raiseError <- importFunction "rts" "raiseError" () [I32]
@@ -59,21 +131,32 @@ mkWasm defs stackSize heapSize =
         atanFn <- importFunction "rts" "atan" f64 [F64]
         atan2Fn <- importFunction "rts" "atan2" f64 [F64]
         systemInfoFn <- importFunction "rts" "systemInfo" i32 [I32]
+
+--        importFnsVoid <- mapM (makeImportExtern ()) (onlyReturn "C_Unit" forn)
+        importFnsF <- mapM (makeImportExtern f64) (onlyReturn "C_Double" forn)
+        importFns32 <-
+            mapM
+                (makeImportExtern i32)
+                ((onlyReturn "C_Ptr" forn) ++ (onlyReturn "C_IntNative" forn) ++ (onlyReturn "C_Unit" forn))
+        importFns64 <- mapM (makeImportExtern i64) [] 
+                        
         export "mem" $ memory 20 Nothing
     
         stackStart <- export "stackStart" $ global Const i32 0
         stackEnd <- export "stackEnd" $ global Const i32 0
-        stackBase <- global Mut i32 0
-        stackTop <- global Mut i32 0
+        stackBase <- export "stackBase" $ global Mut i32 0
+        stackTop <- export "stackTop" $ global Mut i32 0
     
-        retReg <- global Mut i32 0
-        tmpReg <- global Mut i32 0
+        retReg <- export "retReg" $ global Mut i32 0
+        ret64Reg <- export "ret64Reg" $ global Mut i64 0
+        tmpReg <- export "tmpReg" $ global Mut i32 0
+        tmp64Reg <- export "tmp64Reg" $ global Mut i64 0
 
         export "getStackTop" $ fun i32 $ ret stackTop
     
-        heapStart <- global Mut i32 0
-        heapNext <- global Mut i32 0
-        heapEnd <- global Mut i32 0
+        heapStart <- export "heapStart" $ global Mut i32 0
+        heapNext <- export "heapNext" $ global Mut i32 0
+        heapEnd <- export "heapEnd" $ global Mut i32 0
     
         export "getHeapStart" $ fun i32 $ ret heapStart
         export "setHeapStart" $ fun () $ do
@@ -394,7 +477,7 @@ mkWasm defs stackSize heapSize =
             len <- local i32
             res <- local i32
             width <- local i32
-            next <- local i32
+            next <- local i32 
             len .= getStrLen addr
             res .= packString (getStrSize addr `add` i32c 12) len
             store8 res (len `gt_u` i32c 0) 1 0
@@ -429,7 +512,7 @@ mkWasm defs stackSize heapSize =
                 store8 i (zeroCode `add` (val `rem_s` i32c 10)) 11 0
                 val .= val `div_s` i32c 10
             ret res
-        int64Str <- fun i32 $ do
+        int64Str <- export "int64Str" $ fun i32 $ do
             -- intAddr <- param i32
             val <- param i64
             len <- local i32
@@ -472,7 +555,7 @@ mkWasm defs stackSize heapSize =
                 val .= (val `mul` i32c 10) `add` (char `sub` zero)
             let sign = if' i32 (load8_u i32 addr 0 0 `eq` minus) (i32c (-1)) (i32c 1)
             packInt (sign `mul` val)
-        strInt64 <- fun i64 $ do
+        strInt64 <- export "strInt64" $ fun i64 $ do
             strAddr <- param i32
             len <- local i32
             char <- local i64
@@ -531,7 +614,11 @@ mkWasm defs stackSize heapSize =
                 atanFn,
                 atan2Fn,
                 systemInfoFn,
-                symbols
+                symbols,
+                externsVoid = Map.fromList [], -- importFnsVoid,
+                externsF = Map.fromList importFnsF,
+                externs32 = Map.fromList importFns32,
+                externs64 = Map.fromList importFns64
             }
         let (funcs, st) = runWasmGen emptyState bindings $ mapM mkFunc defs
         let GS { constSectionEnd, constSection } = st
@@ -599,7 +686,11 @@ data GlobalBindings = GB {
     atanFn :: Fn (Proxy F64),
     atan2Fn :: Fn (Proxy F64),
     printValFn :: Fn (),
-    systemInfoFn :: Fn (Proxy I32)
+    systemInfoFn :: Fn (Proxy I32),
+    externsVoid :: Map.Map String (Fn ()),
+    externsF :: Map.Map String (Fn (Proxy F64)),
+    externs32 :: Map.Map String (Fn (Proxy I32)),
+    externs64 :: Map.Map String (Fn (Proxy I64))
 }
 
 type WasmGen = StateT GenState (Reader GlobalBindings)
@@ -640,6 +731,10 @@ hasTailCallOf name (CONSTCASE _ branches defaultBranch) =
 hasTailCallOf name (TAILCALL callee) = name == callee
 hasTailCallOf _ _ = False
 
+extractReg (f,r) = r
+
+extractRegs = map extractReg
+                    
 bcToInstr :: BC -> WasmGen (BCCtx -> GenFun ())
 bcToInstr (ASSIGN l r) = const <$> (getRegVal r >>= setRegVal l)
 bcToInstr (ASSIGNCONST reg c) = const <$> (makeConst c >>= setRegVal reg)
@@ -704,7 +799,80 @@ bcToInstr (ERROR str) = do
     raiseError <- asks raiseErrorFn
     strAddr <- makeConst (Str str)
     return $ const $ call raiseError [strAddr]
+{-
+bcToInstr (FOREIGNCALL loc (FCon (UN "C_Unit")) fname fargs) = do
+  functionIdx <- asks (findExternVoid fname)
+  case functionIdx of
+    Nothing -> do
+        voidMap <- asks getVoidMap 
+        bcToInstr (ERROR ("Could not find " ++ (show fname) ++ " in " ++ (show voidMap)))
+    Just functionIdx -> do
+      printVal <- asks printValFn
+      strAddr <- makeConst (Str (show fname))
+      return $ const $ call printVal [strAddr]
+             {-
+      useRegs <- mapM getRegVal (extractRegs fargs)
+      return $ const $ call functionIdx useRegs
+-}
+-}
+
+bcToInstr (FOREIGNCALL loc (FCon (UN "C_Float")) fname fargs) = do
+  functionIdx <- asks (findExternDbl fname)
+  case functionIdx of
+    Nothing -> do
+        raiseError <- asks raiseErrorFn
+        strAddr <- makeConst (Str ("Could not find " ++ (show fname)))
+        return $ const $ call raiseError [strAddr]
+    Just functionIdx -> do
+        runFloatFunction functionIdx
+  where
+    contextToGenFunRunFloatFunction :: Fn (Proxy F64) -> (GenFun (Proxy F64) -> GenFun (Proxy I32)) -> WasmGen (GenFun ())
+    contextToGenFunRunFloatFunction functionIdx ctor = do
+      useRegs <- mapM pushArgVal (extractRegs fargs)
+      let rv = ctor $ call functionIdx (concat useRegs)
+      setRegVal loc $ rv
+                  
+    runFloatFunction :: Fn (Proxy F64) -> WasmGen (BCCtx -> GenFun ())
+    runFloatFunction functionIdx = do
+        ctor <- genFloat
+        res <- contextToGenFunRunFloatFunction functionIdx ctor
+        return $ const $ res
+               
+bcToInstr (FOREIGNCALL loc _ fname fargs) = do
+  functionIdx <- asks (findExtern32 fname)
+  case functionIdx of
+    Nothing -> do
+        fnmap <- asks getExtern32Map
+        bcToInstr (ERROR ("Could not find " ++ (showableFDesc fname) ++ " in " ++ (show fnmap)))
+    Just functionIdx -> do
+        runIntFunction functionIdx
+  where
+    contextToGenFunRunIntFunction :: Fn (Proxy I32) -> WasmGen (GenFun ())
+    contextToGenFunRunIntFunction functionIdx = do
+      useRegs <- mapM pushArgVal (extractRegs fargs)
+      let rv = call functionIdx (concat useRegs)
+      setRegVal loc $ rv
+                  
+    runIntFunction :: Fn (Proxy I32) -> WasmGen (BCCtx -> GenFun ())
+    runIntFunction functionIdx = do
+        res <- contextToGenFunRunIntFunction functionIdx
+        return $ const $ res
+
 bcToInstr _ = return $ const $ return ()
+
+pushArgVal :: Reg -> WasmGen ([GenFun ()])
+pushArgVal RVal = do
+    -- idx <- asks returnValueIdx
+    return $ [arg $ i32c 0] -- produce idx
+pushArgVal Tmp = do
+    -- idx <- asks tmpIdx
+    return $ [arg $ i32c 0] -- produce idx
+pushArgVal (L offset) = do
+    -- idx <- asks stackBaseIdx
+    return $ [arg $ i32c 0] -- load i32 idx (offset * 4) 2
+pushArgVal (T offset) = do
+    -- idx <- asks stackTopIdx
+    return $ [arg $ i32c 0] -- load i32 idx (offset * 4) 2
 
 getRegVal :: Reg -> WasmGen (GenFun (Proxy I32))
 getRegVal RVal = do
@@ -1215,7 +1383,7 @@ makeOp loc (LStrInt ITBig) [reg] = do
 makeOp loc (LIntStr ITBig) [reg] = do
     val <- getRegVal reg
     int64Str <- asks int64StrFn
-    setRegVal loc $ call int64Str [load i32 val 8 2]
+    setRegVal loc $ call int64Str [load i64 val 8 2]
 makeOp loc (LIntStr ITNative) [reg] = do
     addr <- getRegVal reg
     intStr <- asks intStrFn
